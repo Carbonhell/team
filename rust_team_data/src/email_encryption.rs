@@ -9,38 +9,16 @@
 //! a 24-byte random nonce and the XChaCha20Poly1305-encrypted email address. Utilities are provided
 //! to both encrypt and decrypt.
 
-use blake3::Hash;
-use chacha20poly1305::aead::{Aead, NewAead};
-use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
-use hex::{FromHex, ToHex};
-use std::convert::TryInto;
-use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
+use age::{DecryptError, EncryptError};
+use age::secrecy::ExposeSecret;
+use age::x25519::{Identity, Recipient};
 
 const PREFIX: &str = "encrypted+";
 const SUFFIX: &str = "@rust-lang.invalid";
-const KEY_LENGTH: usize = 32;
-const NONCE_LENGTH: usize = 24;
+
 // TODO ask an infra admin to generate one
-const PUBLIC_KEY: &str = "d1734021de0af5cfeca64482f3c38b3350a38fd4be2e6a88b2c150be4416b261";
+const PUBLIC_KEY: &str = "age1zgpgqyg4v855k2h6lelcpp8z9nq3pk28c4s2mgw6gr39mvznqvjse6rgs4";
 
-fn get_public_key(public_key: &str) -> PublicKey {
-    PublicKey::from(<[u8; 32]>::from_hex(public_key).expect(
-        "invalid public key configured, ensure it was generated with the generate-key command",
-    ))
-}
-
-fn get_private_key(key: &str) -> Result<StaticSecret, Error> {
-    Ok(StaticSecret::from(
-        <[u8; 32]>::from_hex(key).map_err(Error::Hex)?,
-    ))
-}
-
-fn get_kdf<'a>(nonce: &'a [u8], shared_secret: &[u8; 32]) -> (&'a XNonce, Hash) {
-    let nonce = XNonce::from_slice(nonce);
-    let mut kdf = blake3::Hasher::new_keyed(shared_secret);
-    kdf.update(nonce);
-    (nonce, kdf.finalize())
-}
 
 /// Encrypt an email address with x25519-dalek, with blake3 for KDF and ChaCha20Poly1305 for AEAD.
 /// The encryption process follows this flow:
@@ -50,26 +28,10 @@ fn get_kdf<'a>(nonce: &'a [u8], shared_secret: &[u8; 32]) -> (&'a XNonce, Hash) 
 /// 4. the symmetric key is finally used to encrypt the email;
 /// 5. the hex-encoded information required for decryption (public key, nonce, encrypted email) is returned as part of a fake email address.
 pub fn encrypt_with_public_key(email: &str, public_key: &str) -> Result<String, Error> {
-    let ephemeral_secret = EphemeralSecret::random();
-    let ephemeral_public_key = PublicKey::from(&ephemeral_secret);
-    let backend_public_key = get_public_key(public_key);
-    // Generate the shared secret
-    let shared_secret = ephemeral_secret.diffie_hellman(&backend_public_key);
-    // Generate a random nonce every time something is encrypted.
-    let mut nonce = [0u8; NONCE_LENGTH];
-    getrandom::getrandom(&mut nonce).map_err(Error::GetRandom)?;
-    let (nonce, shared_key) = get_kdf(&nonce, shared_secret.as_bytes());
+    let pubkey = public_key.parse::<Recipient>().unwrap();
+    let encrypted = age::encrypt(&pubkey, email.as_bytes()).map_err(Error::EncryptionFailed)?;
 
-    let mut encrypted = init_cipher(shared_key.as_bytes())?
-        .encrypt(nonce, email.as_bytes())
-        .map_err(|_| Error::EncryptionFailed)?;
-
-    // Concatenate ephemeral public key, nonce, and payload, as all three will be needed for decryption.
-    let mut payload = ephemeral_public_key.as_bytes().to_vec();
-    payload.append(&mut nonce.to_vec());
-    payload.append(&mut encrypted);
-
-    Ok(format!("{}{}{}", PREFIX, hex::encode(payload), SUFFIX))
+    Ok(format!("{}{}{}", PREFIX, hex::encode(encrypted), SUFFIX))
 }
 
 pub fn encrypt(email: &str) -> Result<String, Error> {
@@ -81,53 +43,33 @@ pub fn encrypt(email: &str) -> Result<String, Error> {
 /// If the email address was not encrypted by this module it will returned as-is. Because of that
 /// you can pass all the email addresses you have through this function.
 pub fn try_decrypt(private_key: &str, email: &str) -> Result<String, Error> {
-    let combined = match email
+    let encrypted = match email
         .strip_prefix(PREFIX)
         .and_then(|e| e.strip_suffix(SUFFIX))
     {
         Some(encrypted) => hex::decode(encrypted).map_err(Error::Hex)?,
         None => return Ok(email.to_string()),
     };
-    if combined.len() < KEY_LENGTH + NONCE_LENGTH {
-        return Err(Error::WrongKeyLength);
-    }
-
-    let (public_key, rest) = combined.split_at(KEY_LENGTH);
-    let public_key: &[u8; 32] = public_key.try_into().unwrap(); // Safe unwrap as the length is verified above
-    let (nonce, encrypted) = rest.split_at(NONCE_LENGTH);
-
-    let private_key = get_private_key(private_key)?;
-    let shared_secret = private_key.diffie_hellman(&PublicKey::from(public_key.to_owned()));
-    let (nonce, shared_key) = get_kdf(nonce, shared_secret.as_bytes());
-
-    String::from_utf8(
-        init_cipher(shared_key.as_bytes())?
-            .decrypt(nonce, encrypted)
-            .map_err(|_| Error::EncryptionFailed)?,
-    )
-    .map_err(|_| Error::InvalidUtf8)
-}
-
-fn init_cipher(key: &[u8]) -> Result<XChaCha20Poly1305, Error> {
-    let key = Key::from_slice(key);
-    Ok(XChaCha20Poly1305::new(key))
+    
+    let key = private_key.parse::<Identity>().map_err(|_| Error::WrongKeyLength)?;
+    let decrypted = age::decrypt(&key, &encrypted).map_err(Error::DecryptionFailed)?;
+    String::from_utf8(decrypted).map_err(|_| Error::InvalidUtf8)
 }
 
 pub fn generate_x25519_keypair() -> (String, String) {
-    let ephemeral_secret = StaticSecret::random();
-    let ephemeral_public_key = PublicKey::from(&ephemeral_secret);
+    let key = Identity::generate();
+    let pubkey = key.to_public();
     (
-        ephemeral_secret.encode_hex(),
-        ephemeral_public_key.encode_hex(),
+        key.to_string().expose_secret().to_owned(),
+        pubkey.to_string(),
     )
 }
 
 #[derive(Debug)]
 pub enum Error {
-    GetRandom(getrandom::Error),
     Hex(hex::FromHexError),
-    EncryptionFailed,
-    DecryptionFailed,
+    EncryptionFailed(EncryptError),
+    DecryptionFailed(DecryptError),
     WrongKeyLength,
     InvalidUtf8,
 }
@@ -135,10 +77,9 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            Error::GetRandom(e) => write!(f, "{e}"),
             Error::Hex(e) => write!(f, "{e}"),
-            Error::EncryptionFailed => write!(f, "encryption failed"),
-            Error::DecryptionFailed => write!(f, "encryption failed"),
+            Error::EncryptionFailed(e) => write!(f, "{e}"),
+            Error::DecryptionFailed(e) => write!(f, "{e}"),
             Error::InvalidUtf8 => write!(f, "invalid UTF-8"),
             Error::WrongKeyLength => write!(f, "expected 32-bytes key"),
         }
@@ -154,8 +95,8 @@ mod tests {
     #[test]
     fn test_encrypt_decrypt() -> Result<(), Error> {
         const PRIVATE_KEY: &str =
-            "73cd73133b310671933f020b957594960bc046410765a1e145f144f88f379408";
-        const PUBLIC_KEY: &str = "d1734021de0af5cfeca64482f3c38b3350a38fd4be2e6a88b2c150be4416b261";
+            "AGE-SECRET-KEY-1LGM6NASLZZR4VAURT5VZPG2PGYEMF6FSD0SJAWLR2MTXKUJYY97Q47KJH3";
+        const PUBLIC_KEY: &str = "age1zgpgqyg4v855k2h6lelcpp8z9nq3pk28c4s2mgw6gr39mvznqvjse6rgs4";
         const ADDRESS: &str = "foo@example.com";
 
         let encrypted = encrypt_with_public_key(ADDRESS, PUBLIC_KEY)?;
